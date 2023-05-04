@@ -1,26 +1,46 @@
+function mergeTemplateEvents(a, b) {
+  a.types.push(...b.types);
+  a.handlers = {
+    ...a.handlers,
+    ...b.handlers,
+  };
+  return a
+}
+
 function stars(n) {
   return new Array(n).fill("*").join("")
 }
 
-function value(v) {
-  if (v) {
-    if (v.hasOwnProperty("markup")) return `<!--#${v.id}-->${v.markup}`
-    if (Array.isArray(v)) {
-      return `<!--{-->${v.map(value).join("")}<!--}-->`
-    }
-  }
-
-  return `<!--{-->${v}<!--}-->`
+function looksLikeATemplate(o) {
+  return o?.markup && o?.strings
 }
+
+function wrap(v) {
+  if (looksLikeATemplate(v)) return `<!--#${v.id}-->${v.markup}`
+  if (Array.isArray(v)) return `<!--{-->${v.map(wrap).join("")}<!--}-->`
+  return `<!--{-->${v ?? ""}<!--}-->`
+}
+
+let handlerId = 0;
 
 function html(strings, ...values) {
   const L = values.length - 1;
-  const events = new Set();
+
+  const event = {
+    types: [],
+    handlers: {},
+  };
 
   const markup = strings.reduce((markup, string, i) => {
-    let str = markup + string;
+    let str =
+      markup +
+      string.replace(/<\/[\n\s]*textarea[\n\s]*>/, "</textarea><!--&-->");
 
     if (i > L) return str
+
+    if (looksLikeATemplate(values[i]?.[0])) {
+      values[i].forEach((v) => mergeTemplateEvents(event, v.event));
+    }
 
     const isElement = str.match(/<[^\/>]+$/);
     const isAttributeValue = str.match(/(\w+-?\w+)=['"]{1}([^'"]*)$/);
@@ -43,9 +63,11 @@ function html(strings, ...values) {
       if (isAttributeValue) {
         if (isAttributeValue[1].startsWith("on")) {
           const type = isAttributeValue[1].slice(2);
-          events.add(type);
+          event.types.push(type);
+          let id = handlerId++;
+          event.handlers[id] = values[i];
           str = str.replace(/\s(on[\w]+=['""'])$/, " data-$1");
-          return str + i
+          return str + id
         }
 
         return str + values[i]
@@ -59,19 +81,26 @@ function html(strings, ...values) {
       }
     }
 
-    return str + value(values[i])
+    if (str.match(/<textarea[\s\n\r][^>]+>$/m)) {
+      return str + values[i]
+    }
+
+    return str + wrap(values[i])
   }, "");
 
-  return Object.assign(markup, {
+  return {
     markup,
     strings,
     values,
-    events,
+    event: {
+      types: [...new Set(event.types)],
+      handlers: event.handlers,
+    },
     key(v) {
       this.id = v;
       return this
     },
-  })
+  }
 }
 
 const first = (v) => v[0];
@@ -86,6 +115,7 @@ const walk = (node, callback, deep = true) => {
   if (v?.nodeName) return walk(v, callback, deep)
 
   if (deep) walk(node.firstChild, callback, deep);
+  if (v === 1) return
   walk(node.nextSibling, callback, deep);
 };
 
@@ -95,12 +125,13 @@ function templateNodeFromString(str) {
   return node
 }
 
-const isTemplateResult = (v) => v?.hasOwnProperty("markup");
-
 const isPrimitive = (v) => v === null || typeof v !== "object";
 
 const isAttributeSentinel = (node) =>
   node.nodeType === Node.COMMENT_NODE && node.textContent.match(/\*+/);
+
+const isTextAreaSentinel = (node) =>
+  node.nodeType === Node.COMMENT_NODE && node.textContent.match("&");
 
 const isOpenBrace = (node) =>
   node.nodeType === Node.COMMENT_NODE && node.textContent === "{";
@@ -118,7 +149,6 @@ const getBlocks = (sentinel) => {
         const id = node.textContent.match(/^#(.+)$/)?.[1];
         if (id) {
           blocks.push({ id, nodes: [] });
-          // return
         }
       }
 
@@ -141,11 +171,12 @@ function Block(v) {
 }
 
 function getAttributes(p, markup) {
-  return markup
-    .match(/<!--\*+-->(<[^>]+>)/g)
-    .filter((v) => v)
-    [p].split("-->")[1]
-    .match(/[^\t\n\f /><"'=]+=['"][^'"]+['"]|(?<!<)[^\t\n\f /><"'=]+/g)
+  return (
+    markup
+      .match(/<!--\*+-->(<[^>]+>)/g)
+      [p]?.split(/--><[\w-]+\s/)[1]
+      .match(/[^\t\n\f /><"'=]+=['"][^'"]+['"]|(?<!<)[^\t\n\f /><"'=]+/g) || []
+  )
 }
 
 function attributeEntries(attributes) {
@@ -157,7 +188,7 @@ function attributeEntries(attributes) {
   )
 }
 
-const update$1 = (templateResult, rootNode) => {
+const update$1 = (templateResult, rootNode, finalNode) => {
   const { markup, values } = templateResult;
   let v = 0; // value count
   let p = 0; // placeholder count
@@ -169,22 +200,35 @@ const update$1 = (templateResult, rootNode) => {
       const value = values[v++];
 
       if (isPrimitive(value)) {
-        if (nextSibling.nodeType === Node.TEXT_NODE) {
-          if (nextSibling.textContent !== value) {
-            nextSibling.textContent = value;
-          }
+        if (nextSibling.textContent !== value) {
+          nextSibling.textContent = value;
         }
 
         return
-      } else if (Array.isArray(value) && isTemplateResult(value[0])) {
+      } else if (Array.isArray(value)) {
         const blocks = getBlocks(node);
+
         const nextBlocks = value.map(({ id }, i) => {
           if (id !== undefined) {
             return blocks.find((block) => block.id == id) || Block(value[i])
           } else {
-            return blocks[i]
+            return blocks[i] || Block(value[i])
           }
         });
+
+        const removals = blocks.filter(
+          (b, i) =>
+            !(b.id !== undefined
+              ? nextBlocks.find(({ id }) => id === b.id)
+              : nextBlocks[i])
+        );
+
+        removals.forEach(({ nodes }) => nodes.forEach((node) => node.remove()));
+
+        if (!nextBlocks.length) {
+          return node.nextSibling
+        }
+
         const lastNode = last(last(nextBlocks).nodes);
         let t = node;
         nextBlocks.forEach((block, i) => {
@@ -192,8 +236,8 @@ const update$1 = (templateResult, rootNode) => {
           if (t.nextSibling !== firstChild) {
             t.after(...block.nodes);
           }
-          update$1(value[i], firstChild);
           t = last(block.nodes);
+          update$1(value[i], firstChild, t);
         });
 
         return lastNode.nextSibling
@@ -227,25 +271,39 @@ const update$1 = (templateResult, rootNode) => {
 
       v += stars.length;
       p++;
+    } else if (isTextAreaSentinel(node)) {
+      const value = values[v];
+      const textarea = node.previousSibling;
+      if (textarea.value !== value) {
+        textarea.value = value;
+      }
+    }
+
+    if (finalNode && node.isEqualNode(finalNode)) {
+      return 1
     }
   });
 };
 
 const nodes = new WeakSet();
-const eventListeners = new WeakMap();
 const isServer = typeof window === "undefined";
+const eventListeners = new WeakMap();
 
-function bindEvents(rootNode, events = [], values = []) {
+function bindEvents(rootNode, templateResult) {
+  const {
+    event: { types = [], handlers = {} },
+  } = templateResult;
   if (typeof window === "undefined") return
-  rootNode.$values = values;
-  const types = [...events];
   const listeners = eventListeners.get(rootNode) || {};
+
+  rootNode.$handlers = handlers;
+
   types.forEach((type) => {
     if (type in listeners) return
+
     listeners[type] = (e) => {
-      const index = +e.target.dataset[`on${type}`];
-      const fn = rootNode.$values[index];
-      fn?.(e);
+      const k = e.target.dataset[`on${type}`];
+      rootNode.$handlers[k]?.(e);
     };
     rootNode.addEventListener(type, listeners[type]);
   });
@@ -264,7 +322,7 @@ function render(templateResult, rootNode) {
   } else {
     update$1(templateResult, rootNode.firstChild);
   }
-  bindEvents(rootNode, templateResult.events, templateResult.values);
+  bindEvents(rootNode, templateResult);
 }
 
 const subscribers = new Set();
@@ -328,4 +386,4 @@ const define = (name, fn) => {
   );
 };
 
-export { configure, define, html, render };
+export { configure, define, html, render, subscribe };

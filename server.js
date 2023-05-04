@@ -6,12 +6,6 @@ const port = 3000
 
 app.use(express.static("public"))
 
-/*
-
-@todo: provide a wildcard route and use the path to load different "app" files
-
-*/
-
 app.get("/", (_, res) => {
   res.send(
     render(html`
@@ -27,7 +21,8 @@ app.get("/", (_, res) => {
           <title>C8 Playground</title>
         </head>
         <body>
-          <text-tagger></text-tagger>
+          <text-editor></text-editor>
+          <item-list></item-list>
           <script type="module" src="app.js"></script>
         </body>
       </html>
